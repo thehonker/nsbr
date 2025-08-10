@@ -1,0 +1,2 @@
+# nsbr
+NamespaceBridge
