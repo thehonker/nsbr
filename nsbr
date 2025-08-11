@@ -1,0 +1,107 @@
+#!/bin/sh
+
+set -e
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec &>> /var/log/bash-cni-plugin.log
+
+STDIN=$(cat /dev/stdin)
+# echo "stdin: $stdin"
+
+# Directory to store interface mappings
+INTERFACE_MAP_DIR="/var/lib/cni/nsbr/interfaces"
+mkdir -p "$INTERFACE_MAP_DIR"
+
+case $CNI_COMMAND in
+ADD)
+  # Parse the JSON input
+  IPAM_TYPE=$(echo "$STDIN" | jq -r ".ipam.type")
+  IPAM_ADDRESSES=$(echo "$STDIN" | jq -r ".ipam.addresses")
+
+  KEEP_ROUTES=$(echo "$STDIN" | jq -r ".keepRoutes" || echo "")
+
+  if [ "$IPAM_TYPE" != "static" ]; then
+    echo "Unsupported IPAM type: $IPAM_TYPE"
+    exit 1
+  fi
+
+  GATEWAY=$(echo "$IPAM_ADDRESSES" | jq -r ".[0].gateway" || echo "")
+  CONTAINER_ADDRESS=$(echo "$IPAM_ADDRESSES" | jq -r ".[0].address" || echo "")
+
+  mkdir -p /var/run/netns/
+  ln -sfT $CNI_NETNS /var/run/netns/$CNI_CONTAINERID
+
+  RAND=$(tr -dc 'a-f0-9' < /dev/urandom | head -c6)
+  HOST_IF_NAME="veth$RAND"
+  # Store host_if_name in a file using container ID as the filename
+  echo "$HOST_IF_NAME" > "$INTERFACE_MAP_DIR/$CNI_CONTAINERID"
+
+  ip link add $CNI_IFNAME type veth peer name $HOST_IF_NAME
+  ip link set $HOST_IF_NAME up
+  ip addr add $GATEWAY/32 dev $HOST_IF_NAME
+
+  ip link set $CNI_IFNAME netns $CNI_CONTAINERID
+  ip netns exec $CNI_CONTAINERID ip link set $CNI_IFNAME up
+  ip netns exec $CNI_CONTAINERID ip addr add $CONTAINER_ADDRESS dev $CNI_IFNAME
+
+  # if [ "$GATEWAY" != "" ]; then
+  # # ip netns exec $CNI_CONTAINERID ip route del default || true
+  # # ip netns exec $CNI_CONTAINERID ip route add default via $GATEWAY dev $CNI_IFNAME || true
+  # fi
+
+  ip netns exec $CNI_CONTAINERID ip route add $GATEWAY/32 dev $CNI_IFNAME || true
+  ip route add $CONTAINER_ADDRESS dev $HOST_IF_NAME || true
+
+  MAC=$(ip netns exec $CNI_CONTAINERID ip link show $CNI_IFNAME | awk '/ether/ {print $2}')
+echo "{
+  \"cniVersion\": \"0.3.1\",
+  \"interfaces\": [
+      {
+          \"name\": \"$CNI_IFNAME\",
+          \"mac\": \"$MAC\",
+          \"sandbox\": \"$CNI_NETNS\"
+      }
+  ],
+  \"ips\": [
+      {
+          \"version\": \"4\",
+          \"address\": \"$CONTAINER_ADDRESS\",
+          \"gateway\": \"$GATEWAY\"
+      }
+  ]
+}" >&3
+
+;;
+
+DEL)
+  # Retrieve host_if_name from the file using container ID
+  HOST_IF_NAME_FILE="$INTERFACE_MAP_DIR/$CNI_CONTAINERID"
+  if [ ! -f "$HOST_IF_NAME_FILE" ]; then
+    echo "No host interface name found for container ID: $CNI_CONTAINERID"
+    exit 1
+  fi
+
+  HOST_IF_NAME=$(cat "$HOST_IF_NAME_FILE")
+  ip link del $HOST_IF_NAME
+  ip netns exec $CNI_CONTAINERID ip link del $CNI_IFNAME
+  rm -f "$HOST_IF_NAME_FILE"
+;;
+
+GET)
+  echo "GET not supported"
+  exit 1
+;;
+
+VERSION)
+echo '{
+  "cniVersion": "0.3.1",
+  "supportedVersions": [ "0.3.0", "0.3.1", "0.4.0" ]
+}' >&3
+;;
+
+*)
+  echo "Unknown cni commandn: $CNI_COMMAND"
+  exit 1
+;;
+
+esac
